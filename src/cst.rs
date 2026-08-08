@@ -181,8 +181,8 @@ impl Document {
     /// recorded warnings.
     ///
     /// This is the resolver boundary: a resolver takes ownership of the tree and the store,
-    /// decodes what it needs, decides how long the retained source lives, and surfaces the
-    /// warnings however its consumer expects.
+    /// decodes what it needs (see [`crate::decode`]), decides how long the retained source
+    /// lives, and surfaces the warnings however its consumer expects.
     #[must_use]
     pub fn into_parts(self) -> (Value, Vec<Trivia>, SourceStore, Vec<Warning>) {
         let (root, trailing, source) = self.inner.into_parts();

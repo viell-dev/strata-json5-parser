@@ -5,7 +5,7 @@
 //! Every token keeps its absolute byte span, trivia — whitespace runs, `//` and `/* */`
 //! comments, blank lines — is retained instead of discarded, and string/number content stays as
 //! raw source bytes. Decoding (escape resolution, numeric conversion) belongs to a downstream
-//! resolver or deserializer.
+//! resolver or deserializer, served by this crate's [`decode`] module.
 //!
 //! The language is JSON5 exactly: every JSON5 extension (unquoted `IdentifierName` member names,
 //! single-quoted strings, line continuations and the extra escapes, hex numbers,
@@ -23,8 +23,9 @@
 //! [`Syntax`](strata_json_parser::grammar::Syntax) implementation. What remains here is the
 //! public front: [`Json5Parser`], strict via [`Json5Parser::new`], with a builder for the
 //! spec-permitted nesting-depth limit and the lower-layer replacement hooks; the [`Document`]
-//! wrapper carrying the spec-mandated [`Warning`]s (unescaped U+2028/U+2029 in strings); and the
-//! JSON5 error type.
+//! wrapper carrying the spec-mandated [`Warning`]s (unescaped U+2028/U+2029 in strings); the
+//! JSON5 error type; and the [`decode`] module — JSON5-shaped string unescaping, member-name
+//! decoding, and number conversion built on the JSON parser's shared decode primitives.
 //!
 //! # Example
 //!
@@ -56,6 +57,7 @@
 //! ```
 
 mod cst;
+pub mod decode;
 mod parse;
 
 pub use cst::{
