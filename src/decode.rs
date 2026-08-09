@@ -230,7 +230,38 @@ fn decode_identifier(raw: &[u8]) -> Result<String, Error> {
     Ok(out)
 }
 
-/// Converts a raw JSON5 number lexeme into an owned [`Number`].
+/// The written form of a JSON5 number lexeme — author-intent fidelity for the resolved model.
+///
+/// The classification says how the author spelled the number; the converted value lives in
+/// [`Number`] and the raw bytes stay reachable through the CST span, so nothing needs to be
+/// re-stringified. Signs do not affect the classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NumberFormat {
+    /// Decimal digits only: `42`, `+42`, `-17`.
+    Integer,
+    /// A decimal point and no exponent, including the leading/trailing-point forms: `3.25`,
+    /// `.5`, `5.`.
+    Decimal,
+    /// An exponent part: `1.23e+5`, `1E9`.
+    Exponential,
+    /// A hexadecimal integer: `0x1F`, `-0X10`.
+    Hex,
+    /// The `Infinity` word, either sign.
+    Infinity,
+    /// The `NaN` word, either sign.
+    NaN,
+}
+
+/// A decoded JSON5 number lexeme: the converted value and the written form it came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodedNumber {
+    /// The converted value, integer-preserving where it fits.
+    pub value: Number,
+    /// The written form of the lexeme.
+    pub format: NumberFormat,
+}
+
+/// Converts a raw JSON5 number lexeme into a [`DecodedNumber`].
 ///
 /// Handles every shape the number rule admits, plus the bare `Infinity`/`NaN` words (which lex
 /// as their own token kinds but are number values):
@@ -246,8 +277,9 @@ fn decode_identifier(raw: &[u8]) -> Result<String, Error> {
 ///   (`.5`, `5.`) convert to `f64`.
 /// - `-0` and `-0x0` convert to `F64(-0.0)`, preserving the sign.
 ///
-/// The raw text stays available through the CST for consumers needing arbitrary precision.
-pub fn parse_number(raw: &[u8]) -> Result<Number, Error> {
+/// The written form is classified alongside; the raw text stays available through the CST for
+/// consumers needing arbitrary precision.
+pub fn parse_number(raw: &[u8]) -> Result<DecodedNumber, Error> {
     let text = validated_utf8(raw)?;
     let malformed = Error {
         offset: 0,
@@ -261,14 +293,22 @@ pub fn parse_number(raw: &[u8]) -> Result<Number, Error> {
 
     match magnitude {
         "Infinity" => {
-            return Ok(Number::F64(if negative {
+            let value = Number::F64(if negative {
                 f64::NEG_INFINITY
             } else {
                 f64::INFINITY
-            }));
+            });
+
+            return Ok(DecodedNumber {
+                value,
+                format: NumberFormat::Infinity,
+            });
         }
         "NaN" => {
-            return Ok(Number::F64(if negative { -f64::NAN } else { f64::NAN }));
+            return Ok(DecodedNumber {
+                value: Number::F64(if negative { -f64::NAN } else { f64::NAN }),
+                format: NumberFormat::NaN,
+            });
         }
         _ => {}
     }
@@ -277,38 +317,65 @@ pub fn parse_number(raw: &[u8]) -> Result<Number, Error> {
         .strip_prefix("0x")
         .or_else(|| magnitude.strip_prefix("0X"))
     {
-        return parse_hex_number(hex, negative).ok_or(malformed);
+        let value = parse_hex_number(hex, negative).ok_or(malformed)?;
+
+        return Ok(DecodedNumber {
+            value,
+            format: NumberFormat::Hex,
+        });
     }
 
     if magnitude
         .bytes()
         .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
     {
-        return text.parse::<f64>().map(Number::F64).map_err(|_| malformed);
+        let format = if magnitude.bytes().any(|byte| matches!(byte, b'e' | b'E')) {
+            NumberFormat::Exponential
+        } else {
+            NumberFormat::Decimal
+        };
+        let value = text
+            .parse::<f64>()
+            .map(Number::F64)
+            .map_err(|_| malformed)?;
+
+        return Ok(DecodedNumber { value, format });
     }
 
     if magnitude.is_empty() || !magnitude.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(malformed);
     }
 
+    let format = NumberFormat::Integer;
+
     if negative {
-        return match text.parse::<i64>() {
+        let value = match text.parse::<i64>() {
             // `-0` preserves its sign as a float; parsing the text keeps the minus.
-            Ok(0) => text.parse::<f64>().map(Number::F64).map_err(|_| malformed),
-            Ok(value) => Ok(Number::I64(value)),
+            Ok(0) => text
+                .parse::<f64>()
+                .map(Number::F64)
+                .map_err(|_| malformed)?,
+            Ok(value) => Number::I64(value),
             // Negative magnitude beyond i64: fall back to f64.
-            Err(_) => text.parse::<f64>().map(Number::F64).map_err(|_| malformed),
+            Err(_) => text
+                .parse::<f64>()
+                .map(Number::F64)
+                .map_err(|_| malformed)?,
         };
+
+        return Ok(DecodedNumber { value, format });
     }
 
-    match magnitude.parse::<u64>() {
-        Ok(value) => Ok(Number::U64(value)),
+    let value = match magnitude.parse::<u64>() {
+        Ok(value) => Number::U64(value),
         // Magnitude beyond u64: fall back to f64.
         Err(_) => magnitude
             .parse::<f64>()
             .map(Number::F64)
-            .map_err(|_| malformed),
-    }
+            .map_err(|_| malformed)?,
+    };
+
+    Ok(DecodedNumber { value, format })
 }
 
 /// The magnitude of `i64::MIN`, the one negative value whose magnitude does not fit `i64`.
@@ -533,6 +600,20 @@ mod tests {
 
     fn unescape_replacing(raw: &str) -> Result<String, Error> {
         unescape_string(raw.as_bytes(), LoneSurrogates::Replace)
+    }
+
+    #[test]
+    fn number_formats_classify_the_written_form() -> Result<(), Error> {
+        assert_eq!(parse_number(b"42")?.format, NumberFormat::Integer);
+        assert_eq!(parse_number(b"+42")?.format, NumberFormat::Integer);
+        assert_eq!(parse_number(b".5")?.format, NumberFormat::Decimal);
+        assert_eq!(parse_number(b"5.")?.format, NumberFormat::Decimal);
+        assert_eq!(parse_number(b"1.23e+5")?.format, NumberFormat::Exponential);
+        assert_eq!(parse_number(b"-0x10")?.format, NumberFormat::Hex);
+        assert_eq!(parse_number(b"-Infinity")?.format, NumberFormat::Infinity);
+        assert_eq!(parse_number(b"NaN")?.format, NumberFormat::NaN);
+
+        Ok(())
     }
 
     #[test]
@@ -794,53 +875,59 @@ mod tests {
 
     #[test]
     fn json_numbers_still_classify() -> Result<(), Error> {
-        assert_eq!(parse_number(b"0")?, Number::U64(0));
-        assert_eq!(parse_number(b"42")?, Number::U64(42));
+        assert_eq!(parse_number(b"0")?.value, Number::U64(0));
+        assert_eq!(parse_number(b"42")?.value, Number::U64(42));
         assert_eq!(
-            parse_number(b"18446744073709551615")?,
+            parse_number(b"18446744073709551615")?.value,
             Number::U64(u64::MAX)
         );
-        assert_eq!(parse_number(b"-17")?, Number::I64(-17));
+        assert_eq!(parse_number(b"-17")?.value, Number::I64(-17));
         assert_eq!(
-            parse_number(b"-9223372036854775808")?,
+            parse_number(b"-9223372036854775808")?.value,
             Number::I64(i64::MIN)
         );
-        assert_eq!(parse_number(b"3.25")?, Number::F64(3.25));
-        assert_eq!(parse_number(b"1e10")?, Number::F64(1e10));
-        assert_eq!(parse_number(b"2.5E-3")?, Number::F64(2.5e-3));
+        assert_eq!(parse_number(b"3.25")?.value, Number::F64(3.25));
+        assert_eq!(parse_number(b"1e10")?.value, Number::F64(1e10));
+        assert_eq!(parse_number(b"2.5E-3")?.value, Number::F64(2.5e-3));
 
         Ok(())
     }
 
     #[test]
     fn explicit_plus_signs_classify_like_their_unsigned_forms() -> Result<(), Error> {
-        assert_eq!(parse_number(b"+42")?, Number::U64(42));
-        assert_eq!(parse_number(b"+0")?, Number::U64(0));
-        assert_eq!(parse_number(b"+1.5e3")?, Number::F64(1.5e3));
-        assert_eq!(parse_number(b"+0x10")?, Number::U64(16));
+        assert_eq!(parse_number(b"+42")?.value, Number::U64(42));
+        assert_eq!(parse_number(b"+0")?.value, Number::U64(0));
+        assert_eq!(parse_number(b"+1.5e3")?.value, Number::F64(1.5e3));
+        assert_eq!(parse_number(b"+0x10")?.value, Number::U64(16));
 
         Ok(())
     }
 
     #[test]
     fn leading_and_trailing_decimal_points_convert() -> Result<(), Error> {
-        assert_eq!(parse_number(b".5")?, Number::F64(0.5));
-        assert_eq!(parse_number(b"-.5")?, Number::F64(-0.5));
-        assert_eq!(parse_number(b"5.")?, Number::F64(5.0));
-        assert_eq!(parse_number(b"5.e2")?, Number::F64(500.0));
-        assert_eq!(parse_number(b".5e-1")?, Number::F64(0.05));
+        assert_eq!(parse_number(b".5")?.value, Number::F64(0.5));
+        assert_eq!(parse_number(b"-.5")?.value, Number::F64(-0.5));
+        assert_eq!(parse_number(b"5.")?.value, Number::F64(5.0));
+        assert_eq!(parse_number(b"5.e2")?.value, Number::F64(500.0));
+        assert_eq!(parse_number(b".5e-1")?.value, Number::F64(0.05));
 
         Ok(())
     }
 
     #[test]
     fn infinity_and_nan_convert_with_their_signs() -> Result<(), Error> {
-        assert_eq!(parse_number(b"Infinity")?, Number::F64(f64::INFINITY));
-        assert_eq!(parse_number(b"+Infinity")?, Number::F64(f64::INFINITY));
-        assert_eq!(parse_number(b"-Infinity")?, Number::F64(f64::NEG_INFINITY));
+        assert_eq!(parse_number(b"Infinity")?.value, Number::F64(f64::INFINITY));
+        assert_eq!(
+            parse_number(b"+Infinity")?.value,
+            Number::F64(f64::INFINITY)
+        );
+        assert_eq!(
+            parse_number(b"-Infinity")?.value,
+            Number::F64(f64::NEG_INFINITY)
+        );
 
         for (raw, negative) in [(&b"NaN"[..], false), (b"+NaN", false), (b"-NaN", true)] {
-            let Number::F64(value) = parse_number(raw)? else {
+            let Number::F64(value) = parse_number(raw)?.value else {
                 panic!("expected an f64 NaN for {raw:?}");
             };
             assert!(value.is_nan(), "raw {raw:?}");
@@ -852,16 +939,22 @@ mod tests {
 
     #[test]
     fn hex_integers_preserve_integer_identity() -> Result<(), Error> {
-        assert_eq!(parse_number(b"0x0")?, Number::U64(0));
-        assert_eq!(parse_number(b"0xdecaf")?, Number::U64(0x000D_ECAF));
-        assert_eq!(parse_number(b"0XABCDEF")?, Number::U64(0x00AB_CDEF));
-        assert_eq!(parse_number(b"0xFFFFFFFFFFFFFFFF")?, Number::U64(u64::MAX));
-        assert_eq!(parse_number(b"-0x1F")?, Number::I64(-31));
+        assert_eq!(parse_number(b"0x0")?.value, Number::U64(0));
+        assert_eq!(parse_number(b"0xdecaf")?.value, Number::U64(0x000D_ECAF));
+        assert_eq!(parse_number(b"0XABCDEF")?.value, Number::U64(0x00AB_CDEF));
         assert_eq!(
-            parse_number(b"-0x7FFFFFFFFFFFFFFF")?,
+            parse_number(b"0xFFFFFFFFFFFFFFFF")?.value,
+            Number::U64(u64::MAX)
+        );
+        assert_eq!(parse_number(b"-0x1F")?.value, Number::I64(-31));
+        assert_eq!(
+            parse_number(b"-0x7FFFFFFFFFFFFFFF")?.value,
             Number::I64(i64::MIN.saturating_add(1))
         );
-        assert_eq!(parse_number(b"-0x8000000000000000")?, Number::I64(i64::MIN));
+        assert_eq!(
+            parse_number(b"-0x8000000000000000")?.value,
+            Number::I64(i64::MIN)
+        );
 
         Ok(())
     }
@@ -870,17 +963,17 @@ mod tests {
     fn oversized_hex_magnitudes_approximate_as_f64() -> Result<(), Error> {
         // 2^64: one past u64::MAX.
         assert_eq!(
-            parse_number(b"0x10000000000000000")?,
+            parse_number(b"0x10000000000000000")?.value,
             Number::F64(18_446_744_073_709_551_616.0)
         );
         // One past i64::MIN's magnitude.
         assert_eq!(
-            parse_number(b"-0x8000000000000001")?,
+            parse_number(b"-0x8000000000000001")?.value,
             Number::F64(-9_223_372_036_854_775_809.0)
         );
         // Beyond u128: still a finite approximation (2^128).
         assert_eq!(
-            parse_number(b"0x100000000000000000000000000000000")?,
+            parse_number(b"0x100000000000000000000000000000000")?.value,
             Number::F64(340_282_366_920_938_463_463_374_607_431_768_211_456.0)
         );
 
@@ -890,7 +983,7 @@ mod tests {
     #[test]
     fn negative_zeros_preserve_their_sign() -> Result<(), Error> {
         for raw in [&b"-0"[..], b"-0x0", b"-0X00"] {
-            let Number::F64(value) = parse_number(raw)? else {
+            let Number::F64(value) = parse_number(raw)?.value else {
                 panic!("expected -0 to convert as a float for {raw:?}");
             };
             assert_eq!(value.to_bits(), (-0.0_f64).to_bits(), "raw {raw:?}");

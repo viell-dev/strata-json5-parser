@@ -32,7 +32,7 @@ strata-json5-rules -> strata-json5-parser (this crate) -> strata-json5 (resolver
 |----------|--------------|
 | `cst`    | `Document`, `TriviaKind`, `Warning`, `WarningKind`, CST aliases (`Value`, `ArrayNode`, `Element`, `ObjectNode`, `Member`, `SyntaxToken`, `Trivia`) |
 | `parse`  | `Json5Parser<M>`, `Json5ParserBuilder<M>`, `Json5Error`, `Json5ErrorKind`, `DEFAULT_MAX_DEPTH` |
-| `decode` | `unescape_string()`, `decode_member_name()`, `member_name_shape()`, `NameShape`, `parse_number()`; re-exports `Error`, `ErrorKind`, `LoneSurrogates`, `Number` from `strata-json-parser` |
+| `decode` | `unescape_string()`, `decode_member_name()`, `member_name_shape()`, `NameShape`, `parse_number()`, `DecodedNumber`, `NumberFormat`; re-exports `Error`, `ErrorKind`, `LoneSurrogates`, `Number` from `strata-json-parser` |
 | root     | everything above (`cst` and `parse` are private modules re-exported at the root; `decode` is public), plus the `strata-json5-rules` surface re-exported |
 
 ## 2. Instantiating the generic layer
@@ -151,9 +151,11 @@ trusting callers.
   denote the same name — where each escape stands for exactly one character: ES 5.1 identifier
   escapes carry no surrogate pairing, so an escape denoting a surrogate code unit is malformed
   and `policy` applies only to the quoted route.
-- `parse_number(raw)` — integer-preserving classification into the shared `Number`, over every
-  shape the number rule admits plus the bare `Infinity`/`NaN` words (their own token kinds, but
-  number values). As implemented: an optional `+` or `-` on every form; `Infinity`/`NaN`
+- `parse_number(raw)` — returns a `DecodedNumber`: an integer-preserving `Number` value plus
+  the written form as this crate's own `NumberFormat` (`Integer`, `Decimal`, `Exponential`,
+  `Hex`, `Infinity`, `NaN`) — author-intent fidelity the resolver surfaces on its model. It
+  covers every shape the number rule admits plus the bare `Infinity`/`NaN` words (their own
+  token kinds, but number values). As implemented: an optional `+` or `-` on every form; `Infinity`/`NaN`
   convert to `f64` with the sign preserved (`-NaN` sets the sign bit); hex integers convert by
   magnitude — non-negative fitting `u64` is `Number::U64`, negative fitting `i64` is `I64`
   (including `-0x8000000000000000` = `i64::MIN`), anything larger an `f64` approximation that
